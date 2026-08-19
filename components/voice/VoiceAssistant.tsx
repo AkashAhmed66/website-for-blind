@@ -5,7 +5,7 @@ import { useRouter, usePathname } from 'next/navigation';
 import { 
   Mic, MicOff, Volume2, HelpCircle, 
   Sliders, Minus,
-  Play, Pause, X
+  Play, Pause, X, Bot
 } from 'lucide-react';
 
 // ─── Site Structure for menu/submenu reading ─────────────────────────────────
@@ -116,7 +116,6 @@ function isMaleVoice(name: string): boolean {
 }
 
 function pickBestVoice(voices: SpeechSynthesisVoice[]): SpeechSynthesisVoice | null {
-  // First priority: explicit high-quality female natural voices
   for (const keyword of FEMALE_VOICE_KEYWORDS) {
     const match = voices.find(v =>
       !isMaleVoice(v.name) &&
@@ -124,11 +123,9 @@ function pickBestVoice(voices: SpeechSynthesisVoice[]): SpeechSynthesisVoice | n
     );
     if (match) return match;
   }
-  // Fallback: any English voice that is NOT male
   const nonMaleEng = voices.find(v => v.lang.startsWith('en') && !isMaleVoice(v.name));
   if (nonMaleEng) return nonMaleEng;
 
-  // Fallback: any non-male voice
   const anyNonMale = voices.find(v => !isMaleVoice(v.name));
   if (anyNonMale) return anyNonMale;
 
@@ -144,6 +141,7 @@ export default function VoiceAssistant() {
   const [isSettingsOpen, setIsSettingsOpen] = useState(false);
 
   const [isListening, setIsListening] = useState(false);
+  const [isProcessing, setIsProcessing] = useState(false);
   const [isSpeaking, setIsSpeaking] = useState(false);
   const [isPaused, setIsPaused] = useState(false);
   const [transcript, setTranscript] = useState('');
@@ -153,18 +151,23 @@ export default function VoiceAssistant() {
   const [selectedVoice, setSelectedVoice] = useState<string>('');
   const [availableVoices, setAvailableVoices] = useState<SpeechSynthesisVoice[]>([]);
   const [autoReadEnabled, setAutoReadEnabled] = useState(true);
+  const [agentSource, setAgentSource] = useState<'whisper-ollama' | 'local'>('whisper-ollama');
 
   const recognitionRef = useRef<any>(null);
   const synthRef = useRef<SpeechSynthesis | null>(null);
   const audioCtxRef = useRef<AudioContext | null>(null);
-  const lastSpeakEndRef = useRef<number>(0); // timestamp when last utterance ended
-  const speakTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null); // pending speak timer
-  const navTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null); // pending route summary timer
+  const lastSpeakEndRef = useRef<number>(0);
+  const speakTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const navTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const isSpeakingRef = useRef<boolean>(false);
   const isNavigatingWithSpeechRef = useRef<boolean>(false);
   const isHoldingJRef = useRef<boolean>(false);
   const currentTranscriptRef = useRef<string>('');
-  const handleVoiceCommandRef = useRef<(cmd: string) => void>(() => {});
+  
+  // MediaRecorder audio capture refs
+  const mediaRecorderRef = useRef<MediaRecorder | null>(null);
+  const audioChunksRef = useRef<Blob[]>([]);
+  const mediaStreamRef = useRef<MediaStream | null>(null);
 
   // ─── Page Summaries ───────────────────────────────────────────────────────
   const pageSummaries: Record<string, string> = {
@@ -211,7 +214,6 @@ export default function VoiceAssistant() {
       const voices = synthRef.current?.getVoices() || [];
       setAvailableVoices(voices);
       if (voices.length > 0) {
-        // If current voice is not selected or is a male voice, pick the best female voice
         if (!selectedVoice || isMaleVoice(selectedVoice)) {
           const best = pickBestVoice(voices);
           if (best) setSelectedVoice(best.name);
@@ -225,7 +227,7 @@ export default function VoiceAssistant() {
     }
   }, [selectedVoice]);
 
-  // ─── Speech Recognition setup (Continuous while holding J) ────────────────
+  // ─── Native Web Speech Recognition Setup (as fast real-time preview) ───────
   useEffect(() => {
     if (typeof window === 'undefined') return;
     const SpeechRecognition = (window as any).SpeechRecognition || (window as any).webkitSpeechRecognition;
@@ -250,19 +252,16 @@ export default function VoiceAssistant() {
       const clean = fullText.trim();
       currentTranscriptRef.current = clean;
       setTranscript(clean);
-      // NOTE: We do not execute handleVoiceCommand while holding J!
-      // Execution only takes place once J is released in stopListening().
     };
 
     recognition.onerror = (event: any) => {
       if (event.error !== 'no-speech') {
-        setActionMessage(`Mic error: ${event.error || 'Check permissions'}`);
+        console.warn('SpeechRecognition error:', event.error);
       }
     };
 
     recognition.onend = () => {
       setIsListening(false);
-      // If user is still holding down J, restart recognition to prevent dropped audio
       if (isHoldingJRef.current) {
         try {
           recognition.start();
@@ -300,7 +299,6 @@ export default function VoiceAssistant() {
       gain.connect(ctx.destination);
 
       if (type === 'start') {
-        // Rising chime — "I'm listening"
         osc.type = 'sine';
         osc.frequency.setValueAtTime(523.25, now);         // C5
         osc.frequency.exponentialRampToValueAtTime(880, now + 0.14); // A5
@@ -310,7 +308,6 @@ export default function VoiceAssistant() {
         osc.start(now);
         osc.stop(now + 0.3);
       } else {
-        // Falling chime — "done listening"
         osc.type = 'sine';
         osc.frequency.setValueAtTime(880, now);
         osc.frequency.exponentialRampToValueAtTime(440, now + 0.14);
@@ -329,19 +326,17 @@ export default function VoiceAssistant() {
   const speakText = useCallback((text: string, onEnd?: () => void) => {
     if (typeof window === 'undefined' || !('speechSynthesis' in window)) return;
     
-    // Clear any previous queued timer
     if (speakTimerRef.current) {
       clearTimeout(speakTimerRef.current);
       speakTimerRef.current = null;
     }
 
-    // Immediately stop and cancel any currently active speech synthesis
     window.speechSynthesis.cancel();
     if (synthRef.current) {
       synthRef.current.cancel();
     }
 
-    // Ensure at least 0.5 seconds (500ms) has passed since the last utterance ended
+    // 0.5s pause
     const GAP_MS = 500;
     const elapsed = Date.now() - lastSpeakEndRef.current;
     const delay = Math.max(80, elapsed < GAP_MS ? GAP_MS - elapsed : 80);
@@ -356,7 +351,6 @@ export default function VoiceAssistant() {
       utterance.pitch = speechPitch;
       utterance.volume = 1;
 
-      // Strictly select a female voice
       const voices = synthRef.current.getVoices();
       let femaleVoice: SpeechSynthesisVoice | undefined;
       
@@ -383,7 +377,7 @@ export default function VoiceAssistant() {
         setIsSpeaking(false);
         isSpeakingRef.current = false;
         setIsPaused(false);
-        lastSpeakEndRef.current = Date.now(); // record when this utterance finished
+        lastSpeakEndRef.current = Date.now();
         if (onEnd) onEnd();
       };
       utterance.onerror = () => {
@@ -408,15 +402,12 @@ export default function VoiceAssistant() {
       navTimerRef.current = null;
     }
 
-    // Function to check if previous voice (e.g. "Opening Home page") is still speaking
     const checkAndNarrateSummary = () => {
-      // If voice is currently speaking or navigating voice is running, wait for it to finish!
-      if (synthRef.current?.speaking || isSpeakingRef.current || isNavigatingWithSpeechRef.current) {
+      if (synthRef.current?.speaking || isSpeakingRef.current || isNavigatingWithSpeechRef.current || isProcessing) {
         navTimerRef.current = setTimeout(checkAndNarrateSummary, 150);
         return;
       }
 
-      // Check how much time passed since last speech ended (0.5 sec gap)
       const elapsed = Date.now() - lastSpeakEndRef.current;
       const waitTime = Math.max(500 - elapsed, 80);
 
@@ -432,7 +423,6 @@ export default function VoiceAssistant() {
       }, waitTime);
     };
 
-    // Initial check after 200ms to allow route to settle
     navTimerRef.current = setTimeout(checkAndNarrateSummary, 200);
 
     return () => {
@@ -459,37 +449,9 @@ export default function VoiceAssistant() {
     }
     isNavigatingWithSpeechRef.current = false;
     isSpeakingRef.current = false;
-    lastSpeakEndRef.current = Date.now(); // treat stop as end of utterance
+    lastSpeakEndRef.current = Date.now();
     setIsSpeaking(false);
     setIsPaused(false);
-  }, []);
-
-  // ─── Listening controls (Hold J to record, release J to execute command) ───
-  const startListening = useCallback(() => {
-    isHoldingJRef.current = true;
-    currentTranscriptRef.current = '';
-    setTranscript('');
-    stopSpeaking();
-    try {
-      playBeep('start');
-      recognitionRef.current?.start();
-    } catch (e) { console.warn(e); }
-  }, [stopSpeaking]);
-
-  const stopListening = useCallback(() => {
-    isHoldingJRef.current = false;
-    try {
-      playBeep('stop');
-      recognitionRef.current?.stop();
-    } catch (e) { console.warn(e); }
-
-    // After J button hold-on and hold-off is complete: take it as a complete command!
-    const finalCmd = currentTranscriptRef.current.trim();
-    if (finalCmd) {
-      handleVoiceCommandRef.current(finalCmd);
-    } else {
-      setActionMessage('Ready — Press F to read, Hold J to speak');
-    }
   }, []);
 
   // ─── Toggle F key read/pause/resume ──────────────────────────────────────
@@ -509,41 +471,6 @@ export default function VoiceAssistant() {
     }
   // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [isSpeaking, isPaused]);
-
-  // ─── Keyboard shortcuts ───────────────────────────────────────────────────
-  useEffect(() => {
-    const handleKeyDown = (e: KeyboardEvent) => {
-      if (['INPUT', 'TEXTAREA', 'SELECT'].includes((e.target as HTMLElement).tagName)) return;
-
-      if (e.key.toLowerCase() === 'f') {
-        e.preventDefault();
-        toggleReadPage();
-      } else if (e.key.toLowerCase() === 'j') {
-        e.preventDefault();
-        if (e.repeat) return;
-        stopSpeaking();
-        if (!isListening) startListening();
-      } else if (e.key === 'Escape') {
-        stopSpeaking();
-        if (isListening) stopListening();
-      }
-    };
-
-    const handleKeyUp = (e: KeyboardEvent) => {
-      if (['INPUT', 'TEXTAREA', 'SELECT'].includes((e.target as HTMLElement).tagName)) return;
-      if (e.key.toLowerCase() === 'j') {
-        e.preventDefault();
-        stopListening();
-      }
-    };
-
-    window.addEventListener('keydown', handleKeyDown);
-    window.addEventListener('keyup', handleKeyUp);
-    return () => {
-      window.removeEventListener('keydown', handleKeyDown);
-      window.removeEventListener('keyup', handleKeyUp);
-    };
-  }, [isSpeaking, isPaused, isListening, toggleReadPage, startListening, stopListening, stopSpeaking]);
 
   // ─── Reading helpers ──────────────────────────────────────────────────────
   const readPageSummary = useCallback(() => {
@@ -642,19 +569,163 @@ export default function VoiceAssistant() {
     });
   }, [pathname, router, speakText, readPageSummary]);
 
-  // ─── Voice command intent handler ────────────────────────────────────────
+  // ─── Execute Agent Action returned by Ollama / Local Engine ───────────────
+  const executeAgentAction = useCallback((action: any, speech: string) => {
+    if (!action || !action.tool) {
+      if (speech) speakText(speech);
+      return;
+    }
+
+    const { tool, params = {} } = action;
+
+    switch (tool) {
+      case 'navigatePage': {
+        const targetPath = params.path || '/';
+        const announcement = speech || params.announcement || `Navigating to ${targetPath}`;
+        const actionLabel = `Opening ${targetPath === '/' ? 'Home' : targetPath.split('/').pop()?.replace(/-/g, ' ')}`;
+        navigateWithSpeech(targetPath, announcement, actionLabel);
+        break;
+      }
+      case 'readPageSummary':
+        if (speech) {
+          speakText(speech, () => readPageSummary());
+        } else {
+          readPageSummary();
+        }
+        break;
+      case 'readFullPage':
+        if (speech) {
+          speakText(speech, () => readFullPage());
+        } else {
+          readFullPage();
+        }
+        break;
+      case 'readMainMenu':
+        readMainMenu();
+        break;
+      case 'readSubMenu':
+        readSubMenu(params.section || 'services');
+        break;
+      case 'toggleAutoRead': {
+        const enabled = params.enabled !== undefined ? params.enabled : !autoReadEnabled;
+        setAutoReadEnabled(enabled);
+        const reply = speech || (enabled ? 'Automatic page reading is now started.' : 'Automatic page reading is now stopped.');
+        speakText(reply);
+        setActionMessage(enabled ? 'Auto-read started' : 'Auto-read stopped');
+        break;
+      }
+      case 'scrollPage': {
+        const dir = params.direction || 'down';
+        if (dir === 'up') {
+          window.scrollTo({ top: 0, behavior: 'smooth' });
+          speakText(speech || 'Back to top.');
+          setActionMessage('Scrolled to top');
+        } else {
+          window.scrollBy({ top: 500, behavior: 'smooth' });
+          speakText(speech || 'Scrolled down.');
+          setActionMessage('Scrolled down');
+        }
+        break;
+      }
+      case 'provideHelp':
+        readHelp();
+        break;
+      case 'stopSpeech':
+        stopSpeaking();
+        setActionMessage('Stopped');
+        break;
+      case 'generalAnswer':
+      default:
+        if (speech) {
+          speakText(speech);
+          setActionMessage('Agent replied');
+        }
+        break;
+    }
+  }, [autoReadEnabled, navigateWithSpeech, readFullPage, readHelp, readMainMenu, readPageSummary, readSubMenu, speakText, stopSpeaking]);
+
+  // ─── Process Transcript through Ollama Agent Endpoint ─────────────────────
+  const processTranscriptWithAgent = useCallback(async (textToProcess: string) => {
+    if (!textToProcess || !textToProcess.trim()) return;
+
+    setIsProcessing(true);
+    setActionMessage(`Thinking… "${textToProcess.slice(0, 35)}"`);
+
+    try {
+      const res = await fetch('/api/voice/agent', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          transcript: textToProcess,
+          currentPage: pathname,
+          autoReadEnabled,
+        }),
+      });
+
+      if (res.ok) {
+        const data = await res.json();
+        setAgentSource(data.source === 'ollama' ? 'whisper-ollama' : 'local');
+        executeAgentAction(data.action, data.speech);
+      } else {
+        throw new Error(`Agent API returned ${res.status}`);
+      }
+    } catch (err: any) {
+      console.warn('[Agent Fallback Triggered]:', err?.message);
+      // Fallback local matching
+      handleVoiceCommand(textToProcess);
+    } finally {
+      setIsProcessing(false);
+    }
+  // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [autoReadEnabled, executeAgentAction, pathname]);
+
+  // ─── Process Audio Blob with Python faster-whisper STT Service ────────────
+  const processAudioWithAgent = useCallback(async (audioBlob: Blob) => {
+    setIsProcessing(true);
+    setActionMessage('Transcribing with faster-whisper…');
+
+    try {
+      const formData = new FormData();
+      formData.append('file', audioBlob, 'voice_command.webm');
+
+      const sttRes = await fetch('/api/voice/transcribe', {
+        method: 'POST',
+        body: formData,
+      });
+
+      if (sttRes.ok) {
+        const data = await sttRes.json();
+        const whisperText = (data.text || '').trim();
+        if (whisperText) {
+          setTranscript(whisperText);
+          await processTranscriptWithAgent(whisperText);
+          return;
+        }
+      }
+      throw new Error('STT returned empty or offline');
+    } catch (err: any) {
+      console.warn('[STT Service Fallback]:', err?.message);
+      // Fallback to text captured by Web Speech API
+      const fallbackText = currentTranscriptRef.current.trim();
+      if (fallbackText) {
+        await processTranscriptWithAgent(fallbackText);
+      } else {
+        setActionMessage('Ready — Press F to read, Hold J to speak');
+      }
+    } finally {
+      setIsProcessing(false);
+    }
+  }, [processTranscriptWithAgent]);
+
+  // ─── Local Fallback Command Intent Handler ────────────────────────────────
   const handleVoiceCommand = useCallback((cmd: string) => {
     const lower = cmd.toLowerCase().trim();
 
-    // Stop / Disable Auto-Read
     if (
       lower.includes('stop auto read') || 
       lower.includes('disable auto read') || 
       lower.includes('turn off auto read') || 
-      lower.includes('auto read off') || 
-      lower.includes('stop automatic reading') ||
-      lower.includes('disable automatic reading') ||
-      lower.includes('turn off automatic reading')
+      lower.includes('auto read off')
     ) {
       setAutoReadEnabled(false);
       speakText('Automatic page reading is now stopped.');
@@ -662,15 +733,11 @@ export default function VoiceAssistant() {
       return;
     }
 
-    // Start / Enable Auto-Read
     if (
       lower.includes('start auto read') || 
       lower.includes('enable auto read') || 
       lower.includes('turn on auto read') || 
-      lower.includes('auto read on') || 
-      lower.includes('start automatic reading') ||
-      lower.includes('enable automatic reading') ||
-      lower.includes('turn on automatic reading')
+      lower.includes('auto read on')
     ) {
       setAutoReadEnabled(true);
       speakText('Automatic page reading is now started.');
@@ -678,8 +745,7 @@ export default function VoiceAssistant() {
       return;
     }
 
-    // Toggle Auto-Read
-    if (lower.includes('toggle auto read') || lower.includes('toggle automatic reading')) {
+    if (lower.includes('toggle auto read')) {
       setAutoReadEnabled(prev => {
         const next = !prev;
         speakText(next ? 'Automatic page reading is now started.' : 'Automatic page reading is now stopped.');
@@ -689,50 +755,37 @@ export default function VoiceAssistant() {
       return;
     }
 
-    // Stop speaking
     if (lower.includes('stop') || lower.includes('pause') || lower.includes('be quiet') || lower.includes('shut up') || lower.includes('quiet')) {
       stopSpeaking();
       setActionMessage('Stopped');
       return;
     }
 
-    // Help
     if (lower.includes('help') || lower.includes('what can you do') || lower.includes('commands') || lower.includes('guide')) {
       readHelp();
       return;
     }
 
-    // Read Summary
     if (lower.includes('summary') || lower.includes('summarize') || lower.includes('brief') || lower.includes('overview')) {
       readPageSummary();
       return;
     }
 
-    // Read Full / Complete Page
     if (lower.includes('complete') || lower.includes('full page') || lower.includes('whole page') || lower.includes('entire page') || lower.includes('everything') || lower.includes('all content') || lower.includes('read all')) {
       readFullPage();
       return;
     }
 
-    // Read Highlights / Current Page
     if (lower.includes('read page') || lower.includes('read this') || lower.includes('read content') || lower.includes('read highlights')) {
       readCurrentPage();
       return;
     }
 
-    // Read Main Menu
     if (lower.includes('menu') || lower.includes('list pages') || lower.includes('all pages') || lower.includes('navigation') || lower.includes('list navigation')) {
       readMainMenu();
       return;
     }
 
-    // Read Sub-menu
-    const subMenuMatch = lower.match(/sub.?menu(?:\s+of)?\s+(.+)|(.+?)\s+sub.?menu/);
-    if (subMenuMatch) {
-      const sectionName = (subMenuMatch[1] || subMenuMatch[2] || '').trim();
-      readSubMenu(sectionName);
-      return;
-    }
     if (lower.includes('services sub') || (lower.includes('sub') && lower.includes('service'))) {
       readSubMenu('services');
       return;
@@ -746,7 +799,6 @@ export default function VoiceAssistant() {
       return;
     }
 
-    // Scroll
     if (lower.includes('scroll down') || lower.includes('go down')) {
       window.scrollBy({ top: 500, behavior: 'smooth' });
       setActionMessage('Scrolled down');
@@ -760,7 +812,6 @@ export default function VoiceAssistant() {
       return;
     }
 
-    // ── Navigation ──
     if (lower === 'home' || lower.includes('go home') || lower.includes('go to home')) {
       navigateWithSpeech('/', 'Opening the Home page.', 'Opening Home');
       return;
@@ -870,16 +921,147 @@ export default function VoiceAssistant() {
       return;
     }
 
-    // Unrecognized — give helpful feedback
     speakText(`Sorry, I did not understand that. Say "help" to hear all available voice commands.`);
     setActionMessage(`Heard: "${cmd.slice(0, 40)}"`);
   // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [router, readHelp, readPageSummary, readFullPage, readCurrentPage, readMainMenu, readSubMenu, speakText, stopSpeaking, navigateWithSpeech]);
 
-  // Keep handleVoiceCommandRef in sync
+  // ─── Start Listening (MediaRecorder + Native preview) ─────────────────────
+  const startListening = useCallback(() => {
+    isHoldingJRef.current = true;
+    currentTranscriptRef.current = '';
+    setTranscript('');
+    stopSpeaking();
+    playBeep('start');
+    setIsListening(true);
+    setActionMessage('Listening… speak while holding J');
+
+    // Start raw audio recording via MediaRecorder for Whisper STT with noise suppression
+    if (typeof navigator !== 'undefined' && navigator.mediaDevices && navigator.mediaDevices.getUserMedia) {
+      navigator.mediaDevices.getUserMedia({
+        audio: {
+          echoCancellation: true,
+          noiseSuppression: true,
+          autoGainControl: true,
+          channelCount: 1,
+          sampleRate: { ideal: 48000 },
+        },
+      }).then((stream) => {
+        mediaStreamRef.current = stream;
+        try {
+          const mimeType = MediaRecorder.isTypeSupported('audio/webm;codecs=opus')
+            ? 'audio/webm;codecs=opus'
+            : MediaRecorder.isTypeSupported('audio/webm')
+            ? 'audio/webm'
+            : '';
+          const recorder = mimeType 
+            ? new MediaRecorder(stream, { mimeType, audioBitsPerSecond: 128000 }) 
+            : new MediaRecorder(stream, { audioBitsPerSecond: 128000 });
+          audioChunksRef.current = [];
+          
+          recorder.ondataavailable = (e) => {
+            if (e.data && e.data.size > 0) {
+              audioChunksRef.current.push(e.data);
+            }
+          };
+
+          recorder.start(100);
+          mediaRecorderRef.current = recorder;
+        } catch (recErr) {
+          console.warn('MediaRecorder init error:', recErr);
+        }
+      }).catch((streamErr) => {
+        console.warn('Microphone stream error, falling back to Web Speech API:', streamErr);
+      });
+    }
+
+    // Start native speech recognition as real-time visual feedback
+    try {
+      recognitionRef.current?.start();
+    } catch (e) {}
+  }, [stopSpeaking]);
+
+  // ─── Stop Listening (Triggers Whisper STT ➔ Ollama Agent Execution) ───────
+  const stopListening = useCallback(() => {
+    isHoldingJRef.current = false;
+    setIsListening(false);
+    playBeep('stop');
+
+    // Stop native recognition
+    try {
+      recognitionRef.current?.stop();
+    } catch (e) {}
+
+    // Finalize MediaRecorder audio stream
+    if (mediaRecorderRef.current && mediaRecorderRef.current.state !== 'inactive') {
+      mediaRecorderRef.current.onstop = async () => {
+        const mimeType = mediaRecorderRef.current?.mimeType || 'audio/webm';
+        const audioBlob = new Blob(audioChunksRef.current, { type: mimeType });
+
+        if (mediaStreamRef.current) {
+          mediaStreamRef.current.getTracks().forEach((track) => track.stop());
+          mediaStreamRef.current = null;
+        }
+
+        if (audioBlob.size > 1200) {
+          await processAudioWithAgent(audioBlob);
+        } else {
+          const finalCmd = currentTranscriptRef.current.trim();
+          if (finalCmd) {
+            await processTranscriptWithAgent(finalCmd);
+          } else {
+            setActionMessage('Ready — Press F to read, Hold J to speak');
+          }
+        }
+      };
+
+      try {
+        mediaRecorderRef.current.stop();
+      } catch (e) {}
+    } else {
+      const finalCmd = currentTranscriptRef.current.trim();
+      if (finalCmd) {
+        processTranscriptWithAgent(finalCmd);
+      } else {
+        setActionMessage('Ready — Press F to read, Hold J to speak');
+      }
+    }
+  }, [processAudioWithAgent, processTranscriptWithAgent]);
+
+  // ─── Keyboard shortcuts (F for read/pause, J for push-to-talk) ────────────
   useEffect(() => {
-    handleVoiceCommandRef.current = handleVoiceCommand;
-  }, [handleVoiceCommand]);
+    const handleKeyDown = (e: KeyboardEvent) => {
+      if (['INPUT', 'TEXTAREA', 'SELECT'].includes((e.target as HTMLElement).tagName)) return;
+
+      if (e.key.toLowerCase() === 'f') {
+        e.preventDefault();
+        toggleReadPage();
+      } else if (e.key.toLowerCase() === 'j') {
+        e.preventDefault();
+        if (e.repeat) return;
+        stopSpeaking();
+        if (!isListening && !isProcessing) startListening();
+      } else if (e.key === 'Escape') {
+        stopSpeaking();
+        if (isListening) stopListening();
+      }
+    };
+
+    const handleKeyUp = (e: KeyboardEvent) => {
+      if (['INPUT', 'TEXTAREA', 'SELECT'].includes((e.target as HTMLElement).tagName)) return;
+      if (e.key.toLowerCase() === 'j') {
+        e.preventDefault();
+        if (isListening) stopListening();
+      }
+    };
+
+    window.addEventListener('keydown', handleKeyDown);
+    window.addEventListener('keyup', handleKeyUp);
+    return () => {
+      window.removeEventListener('keydown', handleKeyDown);
+      window.removeEventListener('keyup', handleKeyUp);
+    };
+  }, [isSpeaking, isPaused, isListening, isProcessing, toggleReadPage, startListening, stopListening, stopSpeaking]);
 
   // ─── Render ───────────────────────────────────────────────────────────────
   return (
@@ -900,10 +1082,11 @@ export default function VoiceAssistant() {
             </div>
           </div>
           <div className="flex flex-col text-left">
-            <span className="text-xs font-bold text-white">
-              Voice Assistant <span className="text-[10px] text-[#7dc535] font-normal">• Active</span>
+            <span className="text-xs font-bold text-white flex items-center gap-1.5">
+              Voice Navigator 
+              <span className="text-[10px] text-[#7dc535] font-normal">• Active</span>
             </span>
-            <span className="text-[10px] text-slate-400">[F] Read · [J] Speak · [Esc] Stop</span>
+            <span className="text-[10px] text-slate-400">[F] Read · [J] Hold to Talk · [Esc] Stop</span>
           </div>
         </button>
       ) : (
@@ -915,10 +1098,15 @@ export default function VoiceAssistant() {
           <div className="p-3.5 bg-white/5 border-b border-white/10 flex items-center justify-between">
             <div className="flex items-center gap-2">
               <div className="p-1.5 rounded-lg bg-[#7dc535]/20 text-[#7dc535]">
-                <Mic className="w-4 h-4" />
+                <Bot className="w-4 h-4" />
               </div>
               <div>
-                <h3 className="text-xs font-bold text-white">Voice Navigator</h3>
+                <h3 className="text-xs font-bold text-white flex items-center gap-1.5">
+                  Voice Agent
+                  <span className="text-[9px] px-1.5 py-0.5 rounded bg-emerald-500/20 text-[#7dc535] border border-emerald-500/30">
+                    Qwen + Whisper
+                  </span>
+                </h3>
                 <p className="text-[10px] text-slate-400">Accessibility Audio Agent · Tech Eureka</p>
               </div>
             </div>
@@ -966,7 +1154,7 @@ export default function VoiceAssistant() {
                   <kbd className="px-1.5 py-0.5 rounded bg-white/10 text-[#7dc535] text-[10px] self-start">F</kbd>
                   <span>Read page · Pause · Resume</span>
                   <kbd className="px-1.5 py-0.5 rounded bg-white/10 text-[#7dc535] text-[10px] self-start">J</kbd>
-                  <span>Hold to speak a command. Stops reading instantly.</span>
+                  <span>Hold to record, release to execute command.</span>
                   <kbd className="px-1.5 py-0.5 rounded bg-white/10 text-[#7dc535] text-[10px] self-start">Esc</kbd>
                   <span>Stop reading or listening at any time.</span>
                 </div>
@@ -1018,7 +1206,7 @@ export default function VoiceAssistant() {
 
               {availableVoices.length > 0 && (
                 <div className="space-y-1">
-                  <label htmlFor="voice-select" className="text-[11px] text-slate-400">Voice:</label>
+                  <label htmlFor="voice-select" className="text-[11px] text-slate-400">Voice (Female Natural):</label>
                   <select
                     id="voice-select"
                     value={selectedVoice}
@@ -1082,23 +1270,20 @@ export default function VoiceAssistant() {
             {/* Status Bar */}
             <div className="flex items-center justify-between p-3 rounded-xl bg-white/5 border border-white/5" aria-live="polite" aria-atomic="true">
               <div className="flex items-center gap-2">
-                <span className={`w-2.5 h-2.5 rounded-full ${isSpeaking ? 'bg-sky-400 animate-pulse' : isListening ? 'bg-red-500 animate-ping' : 'bg-[#7dc535]'}`}></span>
+                <span className={`w-2.5 h-2.5 rounded-full ${isProcessing ? 'bg-amber-400 animate-spin' : isSpeaking ? 'bg-sky-400 animate-pulse' : isListening ? 'bg-red-500 animate-ping' : 'bg-[#7dc535]'}`}></span>
                 <span className="text-xs font-medium text-white">
-                  {isSpeaking
+                  {isProcessing
+                    ? 'Reasoning with Agent…'
+                    : isSpeaking
                     ? isPaused ? 'Paused — Press F to resume' : 'Reading aloud…'
-                    : isListening ? 'Listening for command…'
+                    : isListening ? 'Listening… Release J when done'
                     : 'Ready'}
                 </span>
               </div>
-              {/* Waveform */}
-              <div className="flex items-center gap-0.5 h-4" aria-hidden="true">
-                {[40, 70, 30, 90, 50, 80, 45].map((h, idx) => (
-                  <span
-                    key={idx}
-                    className={`w-0.5 rounded-full bg-[#7dc535] transition-all duration-150 ${isSpeaking || isListening ? 'opacity-100 animate-pulse' : 'opacity-25'}`}
-                    style={{ height: isSpeaking || isListening ? `${h}%` : '18%' }}
-                  ></span>
-                ))}
+              <div className="flex items-center gap-1">
+                <span className="text-[9px] px-1.5 py-0.5 rounded bg-white/5 text-slate-400 font-mono">
+                  {agentSource === 'whisper-ollama' ? 'AI Agent' : 'Fast STT'}
+                </span>
               </div>
             </div>
 
@@ -1165,26 +1350,32 @@ export default function VoiceAssistant() {
 
             {/* Push-to-Talk Button */}
             <button
-              onPointerDown={(e) => { e.preventDefault(); startListening(); }}
-              onPointerUp={(e) => { e.preventDefault(); stopListening(); }}
+              onPointerDown={(e) => { e.preventDefault(); if (!isListening && !isProcessing) startListening(); }}
+              onPointerUp={(e) => { e.preventDefault(); if (isListening) stopListening(); }}
               onPointerLeave={() => { if (isHoldingJRef.current) stopListening(); }}
               className={`w-full flex items-center justify-center gap-2 py-3 px-3 rounded-xl font-semibold text-xs transition-all ${
-                isListening
+                isProcessing
+                  ? 'bg-amber-500/20 text-amber-300 border border-amber-500/40'
+                  : isListening
                   ? 'bg-red-500/25 text-red-300 border-2 border-red-500/60 animate-pulse'
                   : 'btn-brand'
               }`}
-              aria-label={isListening ? 'Release to stop listening' : 'Hold to speak a voice command'}
+              aria-label={isListening ? 'Release to process command' : 'Hold to speak a voice command'}
               title="Hold J key anywhere to speak"
+              disabled={isProcessing}
             >
-              {isListening
-                ? <><MicOff className="w-4 h-4" /><span className="text-red-300">Listening… Release to send</span></>
-                : <><Mic className="w-4 h-4 text-slate-950" /><span className="text-slate-950">Hold J to Speak</span></>
-              }
+              {isProcessing ? (
+                <span className="text-amber-300">Processing with Agent…</span>
+              ) : isListening ? (
+                <><MicOff className="w-4 h-4" /><span className="text-red-300">Listening… Release to Send</span></>
+              ) : (
+                <><Mic className="w-4 h-4 text-slate-950" /><span className="text-slate-950">Hold J to Speak</span></>
+              )}
             </button>
 
             {/* Quick Navigation Chips */}
             <div className="space-y-1.5">
-              <div className="text-[10px] text-slate-500 font-semibold uppercase tracking-wider">Quick Navigate:</div>
+              <div className="text-[10px] text-slate-500 font-semibold uppercase tracking-wider">Quick Commands:</div>
               <div className="flex flex-wrap gap-1.5">
                 {[
                   { label: '🗂 Menu', cmd: 'read the menu' },
@@ -1200,7 +1391,7 @@ export default function VoiceAssistant() {
                 ].map((item, idx) => (
                   <button
                     key={idx}
-                    onClick={() => handleVoiceCommand(item.cmd)}
+                    onClick={() => processTranscriptWithAgent(item.cmd)}
                     className="px-2 py-1 rounded-lg bg-white/5 hover:bg-[#7dc535]/20 hover:text-[#7dc535] text-[11px] text-slate-300 border border-white/5 transition-colors"
                     aria-label={`Quick command: ${item.cmd}`}
                   >
